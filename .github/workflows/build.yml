@@ -1,0 +1,88 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'init'
+      - 'build.sh'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '构建完顺便发 Release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq cpio busybox-static
+
+      - name: 取基础 initramfs 基础包 initramfs-base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p base
+          if ! gh release download initramfs-base --repo "$GITHUB_REPOSITORY" -D base -p '*.cpio.gz'; then
+            echo "::error::仓库里没有 initramfs-base Release 资产，先手动创建: gh release create initramfs-base <initramfs.cpio.gz>"
+            exit 1
+          fi
+          ls -lh base/
+
+      - name: 构建
+        run: |
+          set -e
+          BASE=$(ls base/*.cpio.gz | head -1)
+          echo "base = $BASE"
+          ./build.sh --base "$BASE" --out out
+          ls -lh out/
+
+      - name: 体检（init 必须是最新版、工具集完整）
+        run: |
+          set -e
+          F=$(ls out/*.cpio.gz | head -1)
+          echo "产物: $F"
+          W=$(mktemp -d)
+          gzip -dc "$F" | ( cd "$W" && cpio -idm --quiet )
+          [ -x "$W/init" ] || { echo "::error::init 缺失或不可执行"; exit 1; }
+          grep -q 'boot-initramfs r2' "$W/init" || { echo "::error::init 不是 r2（缺标记）"; exit 1; }
+          for a in bin/busybox bin/findfs bin/blkid bin/awk bin/sed bin/mount sbin/e2fsck; do
+            [ -e "$W/$a" ] || { echo "::error::缺少 $a"; exit 1; }
+          done
+          cmp -s init "$W/init" || { echo "::error::包内 init 与仓库 init 不一致"; exit 1; }
+          echo "条目数: $(find "$W" | wc -l)"
+          echo "大小:   $(du -h "$F" | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crux-initramfs-${{ github.sha }}
+          path: |
+            out/*.cpio.gz
+            out/SHA256SUMS
+          if-no-files-found: error
+
+      - name: 发 Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="initramfs-$(date +%Y%m%d-%H%M)"
+          cat > /tmp/note.md <<'NOTE'
+          init：根分区自动定位（cmdline root= 优先，没给才自动探测）+ e2fsck 体检/修复
+          + /var/lib/crux/boottrace.txt 报告 + earlylog。
+
+          部署：mount /dev/sda35 /mnt/efi && cp <产物> /mnt/efi/EFI/crux/initramfs.cpio.gz
+          NOTE
+          gh release create "$TAG" -t "crux initramfs $TAG" -n "$(cat /tmp/note.md)" \
+            out/*.cpio.gz out/SHA256SUMS

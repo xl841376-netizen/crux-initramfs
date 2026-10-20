@@ -1,0 +1,262 @@
+#!/bin/busybox sh
+# ============================================================
+#  crux initramfs — 根分区自动选择 + 分区体检/修复
+#  版本: 2026.10.20-r2
+#
+#  设计原则
+#   1) grub 传的 root= 是最高权威；只有完全没给 / 给 auto 时才自动探测
+#   2) 探测顺序可控、可诊断：每一步都写 /dev/kmsg 与 boottrace
+#   3) 任何一步失败都继续尝试下一候选，全失败才进 rescue shell
+#   4) 挂载完成后做体检：模块版本、fstab 一致性、可写性、剩余空间、上次关机状态
+# ============================================================
+
+export PATH=/bin:/sbin
+BB=/bin/busybox
+KVER=$($BB uname -r 2>/dev/null)
+CMDLINE=$($BB cat /proc/cmdline 2>/dev/null)
+
+klog() { $BB echo "[crux-initrd] $*" > /dev/kmsg 2>/dev/null; }
+say()  { $BB echo "=== $* ===" > /dev/kmsg 2>/dev/null; }
+
+# ---------- 0) 基础文件系统 ----------
+$BB mkdir -p /proc /sys /dev /newroot /probe 2>/dev/null
+$BB mount -t proc proc /proc 2>/dev/null
+$BB mount -t sysfs sysfs /sys 2>/dev/null
+$BB mount -t devtmpfs devtmpfs /dev 2>/dev/null
+
+say "boot-initramfs r2 (kver=$KVER)"
+klog "cmdline: $CMDLINE"
+
+# ---------- 1) 解析 cmdline ----------
+ROOTSPEC=
+AUTO=1
+for w in $CMDLINE; do
+    case "$w" in
+        root=*)      ROOTSPEC=${w#root=} ;;
+        crux.auto=0) AUTO=0 ;;
+        crux.auto=1) AUTO=1 ;;
+    esac
+done
+case "$ROOTSPEC" in
+    ""|auto|AUTO) ROOTSPEC="" ;;
+    *) AUTO=0 ;;
+esac
+klog "rootspec='$ROOTSPEC' auto=$AUTO"
+
+# ---------- 2) 设备解析 ----------
+# findfs 兼容封装：PARTLABEL 在部分 busybox 上不支持，退回 blkid 扫描
+by_spec() {
+    spec=$1
+    case "$spec" in
+        PARTLABEL=*)
+            want=${spec#PARTLABEL=}
+            for d in /dev/sda* /dev/mmcblk*p* /dev/nvme*n*p*; do
+                [ -b "$d" ] || continue
+                [ "$($BB blkid -s PARTLABEL -o value "$d" 2>/dev/null)" = "$want" ] && { $BB echo "$d"; return 0; }
+            done
+            return 1 ;;
+        LABEL=*|UUID=*|PARTUUID=*)
+            $BB findfs "$spec" 2>/dev/null && return 0
+            v=${spec#*=}; t=${spec%%=*}
+            for d in /dev/sda* /dev/mmcblk*p* /dev/nvme*n*p*; do
+                [ -b "$d" ] || continue
+                [ "$($BB blkid -s "$t" -o value "$d" 2>/dev/null)" = "$v" ] && { $BB echo "$d"; return 0; }
+            done
+            return 1 ;;
+        /dev/*) [ -b "$spec" ] && { $BB echo "$spec"; return 0; }; return 1 ;;
+        *) $BB findfs "$spec" 2>/dev/null && return 0; return 1 ;;
+    esac
+}
+
+CANDS=""
+add_cand() {
+    [ -n "$1" ] || return 0
+    case " $CANDS " in *" $1 "*) return 0 ;; esac
+    for c in $CANDS; do [ "$c" = "$1" ] && return 0; done
+    CANDS="$CANDS $1"
+}
+
+# 2.1 显式 root= 优先
+if [ -n "$ROOTSPEC" ]; then
+    d=$(by_spec "$ROOTSPEC")
+    add_cand "$d"
+    klog "root= 解析结果: ${d:-失败}"
+fi
+
+# 2.2 自动模式：按 PARTLABEL 惯例（由新到旧）
+if [ "$AUTO" = "1" ] && [ -z "$CANDS" ]; then
+    for pl in linux-root26 linux-root linux-root-next; do
+        d=$(by_spec "PARTLABEL=$pl")
+        [ -n "$d" ] && klog "PARTLABEL=$pl -> $d"
+        add_cand "$d"
+    done
+fi
+
+# 2.3 仍然没有：扫描所有块设备，挑“像 crux root 的 ext4”
+if [ -z "$CANDS" ]; then
+    klog "扫描块设备寻找 crux 根分区…"
+    for d in /dev/sda* /dev/mmcblk*p* /dev/nvme*n*p*; do
+        [ -b "$d" ] || continue
+        typ=$($BB blkid -s TYPE -o value "$d" 2>/dev/null)
+        [ "$typ" = "ext4" ] || continue
+        add_cand "$d"
+    done
+fi
+
+klog "候选列表:$CANDS"
+
+# ---------- 3) 体检 + 修复 + 挂载 ----------
+# probe_root: 只读挂载并检查像不像一个可启动的 crux 根
+probe_root() {
+    dev=$1
+    $BB umount /probe 2>/dev/null
+    $BB mount -o ro -t ext4 "$dev" /probe 2>/dev/null || return 1
+    rc=0
+    [ -e /probe/etc/os-release ] || rc=1
+    [ -x /probe/sbin/init ]      || rc=1
+    $BB umount /probe 2>/dev/null
+    return $rc
+}
+
+fsck_dev() {
+    dev=$1
+    [ -x /sbin/e2fsck ] || { klog "无 e2fsck，跳过分区修复"; return 0; }
+    klog "e2fsck -p $dev"
+    if ! $BB timeout 180 /sbin/e2fsck -p "$dev" > /dev/kmsg 2>&1; then
+        klog "e2fsck -p 未通过，尝试 -fy（自动修复）"
+        $BB timeout 300 /sbin/e2fsck -fy "$dev" > /dev/kmsg 2>&1
+        klog "e2fsck -fy 结束 rc=$?"
+    fi
+}
+
+DEV=
+FSCKED=
+for cand in $CANDS; do
+    [ -b "$cand" ] || continue
+    klog "尝试 $cand"
+    if ! probe_root "$cand"; then
+        klog "$cand 不像 crux 根（缺 os-release / sbin/init），跳过"
+        continue
+    fi
+    fsck_dev "$cand"; FSCKED=$cand
+
+    $BB mkdir -p /newroot
+    if $BB mount -t ext4 "$cand" /newroot 2>/dev/null || $BB mount "$cand" /newroot 2>/dev/null; then
+        DEV=$cand
+        klog "已挂载根分区: $DEV"
+        break
+    else
+        klog "$cand 挂载失败，尝试修复后重挂"
+        fsck_dev "$cand"
+        if $BB mount -t ext4 "$cand" /newroot 2>/dev/null; then
+            DEV=$cand
+            klog "修复后挂载成功: $DEV"
+            break
+        fi
+        klog "$cand 仍然挂不上"
+    fi
+done
+
+if [ -z "$DEV" ]; then
+    say "FAILED: 找不到可用的根分区"
+    klog "候选:$CANDS"
+    $BB echo ""
+    $BB echo "crux initramfs: 无法定位根分区。"
+    $BB echo "候选:$CANDS"
+    $BB echo "可手动尝试: mount /dev/sdaXX /root"
+    exec $BB sh
+fi
+
+# ---------- 4) 可写性 ----------
+RW_OK=0
+if $BB touch /newroot/.crux_rwtest 2>/dev/null; then
+    $BB rm -f /newroot/.crux_rwtest 2>/dev/null
+    RW_OK=1
+else
+    $BB mount -o remount,rw /newroot 2>/dev/null
+    if $BB touch /newroot/.crux_rwtest 2>/dev/null; then
+        $BB rm -f /newroot/.crux_rwtest 2>/dev/null
+        RW_OK=1
+    fi
+fi
+klog "rootfs rw=$RW_OK"
+
+# ---------- 5) 体检报告 ----------
+$BB mkdir -p /newroot/var/lib/crux /newroot/var/log 2>/dev/null
+CRUXDIR=/newroot/var/lib/crux
+REPORT=$CRUXDIR/boottrace.txt
+
+# 5.1 模块版本匹配（内核 vs rootfs 里的 /lib/modules）
+MOD_OK=unknown
+if [ -d "/newroot/lib/modules/$KVER" ] || [ -d "/newroot/usr/lib/modules/$KVER" ]; then
+    MOD_OK=yes
+else
+    MOD_OK=NO
+    klog "警告: rootfs 里没有 /lib/modules/$KVER（内核与系统模块版本不匹配）"
+fi
+
+# 5.2 fstab 的根条目 vs 实际设备
+FSTAB_ROOT=$($BB sed -n 's/^[[:space:]]*\([^#[:space:]]*\)[[:space:]]\+[[:space:]]*\/[[:space:]].*/\1/p' /newroot/etc/fstab 2>/dev/null | $BB head -1)
+ACT_PL=$($BB blkid -s PARTLABEL -o value "$DEV" 2>/dev/null)
+ACT_UUID=$($BB blkid -s UUID -o value "$DEV" 2>/dev/null)
+FSTAB_OK=unknown
+case "$FSTAB_ROOT" in
+    PARTLABEL=*) [ "${FSTAB_ROOT#PARTLABEL=}" = "$ACT_PL" ] && FSTAB_OK=yes || FSTAB_OK=NO ;;
+    UUID=*)      [ "${FSTAB_ROOT#UUID=}" = "$ACT_UUID" ] && FSTAB_OK=yes || FSTAB_OK=NO ;;
+    *) FSTAB_OK="n/a($FSTAB_ROOT)" ;;
+esac
+[ "$FSTAB_OK" = "NO" ] && klog "警告: fstab 根条目($FSTAB_ROOT) 与实际分区(PARTLABEL=$ACT_PL UUID=$ACT_UUID) 不一致"
+
+# 5.3 剩余空间
+FREE=$( $BB df -k /newroot 2>/dev/null | $BB awk 'NR==2{print $4}' )
+FREE_MB=$(( ${FREE:-0} / 1024 ))
+[ "$FREE_MB" -lt 512 ] && klog "警告: 根分区剩余空间仅 ${FREE_MB}MiB"
+
+# 5.4 上次关机是否干净
+CS=$CRUXDIR/shutdown-clean
+if [ -f "$CS" ]; then
+    VERDICT=clean
+    $BB rm -f "$CS" 2>/dev/null
+else
+    VERDICT=dirty
+fi
+$BB echo "$VERDICT" > $CRUXDIR/prev-shutdown-verdict 2>/dev/null
+klog "上次关机: $VERDICT"
+
+# 5.5 落盘报告
+{
+    $BB echo "=== crux boottrace ==="
+    $BB echo "time      : $($BB date 2>/dev/null)"
+    $BB echo "kver      : $KVER"
+    $BB echo "cmdline   : $CMDLINE"
+    $BB echo "rootspec  : ${ROOTSPEC:-auto}"
+    $BB echo "cands     :$CANDS"
+    $BB echo "rootdev   : $DEV (PARTLABEL=$ACT_PL UUID=$ACT_UUID)"
+    $BB echo "fsck      : ${FSCKED:-none}"
+    $BB echo "rw        : $RW_OK"
+    $BB echo "modules   : $MOD_OK (/lib/modules/$KVER)"
+    $BB echo "fstab_root: $FSTAB_ROOT -> match=$FSTAB_OK"
+    $BB echo "free      : ${FREE_MB}MiB"
+    $BB echo "shutdown  : $VERDICT"
+} > "$REPORT" 2>/dev/null
+$BB sync
+
+# ---------- 6) earlylog（不依赖 systemd 持续落盘内核日志）----------
+setsid $BB sh -c '
+  trap "" TERM HUP INT QUIT
+  OUT=/newroot/var/log/crux-early.log
+  $BB mkdir -p /newroot/var/log 2>/dev/null
+  : > "$OUT" 2>/dev/null
+  n=0
+  /bin/busybox cat /dev/kmsg 2>/dev/null | while IFS= read -r line; do
+    printf "%s\n" "$line" >> "$OUT" 2>/dev/null
+    n=$((n+1))
+    if [ $((n % 64)) -eq 0 ]; then /bin/busybox sync 2>/dev/null; fi
+  done
+' >/dev/null 2>&1 &
+
+say "switch_root -> $DEV"
+$BB mount -t proc proc /newroot/proc 2>/dev/null
+$BB mount -t sysfs sysfs /newroot/sys 2>/dev/null
+$BB mount -t devtmpfs devtmpfs /newroot/dev 2>/dev/null
+exec $BB switch_root /newroot /sbin/init
