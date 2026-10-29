@@ -13,16 +13,24 @@
 export PATH=/bin:/sbin
 BB=/bin/busybox
 KVER=$($BB uname -r 2>/dev/null)
-CMDLINE=$($BB cat /proc/cmdline 2>/dev/null)
 
-klog() { $BB echo "[crux-initrd] $*" > /dev/kmsg 2>/dev/null; }
-say()  { $BB echo "=== $* ===" > /dev/kmsg 2>/dev/null; }
-
-# ---------- 0) 基础文件系统 ----------
+# [F1] 必须先把 /proc 挂上，否则下面的 /proc/cmdline 读出来是空的。
+#      原版在 line 26 才 mount proc，而 line 16 就 cat /proc/cmdline，
+#      导致 root=UUID=... 永远读不到（实测 boottrace 里 cmdline 为空）。
 $BB mkdir -p /proc /sys /dev /newroot /probe 2>/dev/null
 $BB mount -t proc proc /proc 2>/dev/null
 $BB mount -t sysfs sysfs /sys 2>/dev/null
 $BB mount -t devtmpfs devtmpfs /dev 2>/dev/null
+
+CMDLINE=$($BB cat /proc/cmdline 2>/dev/null)
+
+# [crux] 打点级别=0(EMERG) + 先清屏：配合 cmdline loglevel=0，
+# 屏幕上只会剩下 CRUX| 开头的行，其余内核打印全部压掉。
+CLEAR=$($BB printf '\033[2J\033[H' 2>/dev/null)
+klog() { $BB printf '<0>%sCRUX| %s\n' "$CLEAR" "$*" > /dev/kmsg 2>/dev/null; }
+say()  { $BB printf '<0>%sCRUX| === %s ===\n' "$CLEAR" "$*" > /dev/kmsg 2>/dev/null; }
+
+# ---------- 0) 基础文件系统（已在文件头完成，此处仅确认）----------
 
 say "boot-initramfs r2 (kver=$KVER)"
 klog "cmdline: $CMDLINE"
@@ -48,19 +56,24 @@ klog "rootspec='$ROOTSPEC' auto=$AUTO"
 by_spec() {
     spec=$1
     case "$spec" in
-        PARTLABEL=*)
-            want=${spec#PARTLABEL=}
-            for d in /dev/sda* /dev/mmcblk*p* /dev/nvme*n*p*; do
-                [ -b "$d" ] || continue
-                [ "$($BB blkid -s PARTLABEL -o value "$d" 2>/dev/null)" = "$want" ] && { $BB echo "$d"; return 0; }
-            done
+        PARTLABEL=*|PARTNAME=*)
+            want=${spec#*=}
+            d=$(part_by_partname "$want"); [ -n "$d" ] && { $BB echo "$d"; return 0; }
+            # 已由 part_by_partname（读 sysfs uevent）处理，不再用 blkid
             return 1 ;;
-        LABEL=*|UUID=*|PARTUUID=*)
+        LABEL=*|UUID=*|PARTUUID=*|PARTNAME=*)
+            # [F3] findfs 不支持 PARTLABEL=，且部分版本连 UUID= 也 rc=1；
+            #      先试 findfs，失败再自己扫（自己扫用的都是 sysfs/超级块，可靠）。
             $BB findfs "$spec" 2>/dev/null && return 0
             v=${spec#*=}; t=${spec%%=*}
-            for d in /dev/sda* /dev/mmcblk*p* /dev/nvme*n*p*; do
+            for d in $(blk_list); do
                 [ -b "$d" ] || continue
-                [ "$($BB blkid -s "$t" -o value "$d" 2>/dev/null)" = "$v" ] && { $BB echo "$d"; return 0; }
+                case "$t" in
+                    PARTNAME)  [ "$(part_name "$d")" = "$v" ] && { $BB echo "$d"; return 0; } ;;
+                    PARTUUID)  [ "$($BB sed -n 's/^PARTUUID=//p' "/sys/class/block/${d##*/}/uevent" 2>/dev/null)" = "$v" ] && { $BB echo "$d"; return 0; } ;;
+                    UUID)      [ "$(fs_uuid "$d")" = "$v" ] && { $BB echo "$d"; return 0; } ;;
+                    LABEL)     [ "$(fs_label "$d")" = "$v" ] && { $BB echo "$d"; return 0; } ;;
+                esac
             done
             return 1 ;;
         /dev/*) [ -b "$spec" ] && { $BB echo "$spec"; return 0; }; return 1 ;;
@@ -68,12 +81,133 @@ by_spec() {
     esac
 }
 
+klog "stage: resolve-start rootspec='$ROOTSPEC' auto=$AUTO"
 CANDS=""
 add_cand() {
     [ -n "$1" ] || return 0
     case " $CANDS " in *" $1 "*) return 0 ;; esac
     for c in $CANDS; do [ "$c" = "$1" ] && return 0; done
     CANDS="$CANDS $1"
+}
+
+# ---------- 动态块设备枚举（不依赖 sdX 命名，按 sysfs 实况）----------
+# 只取"有分区号"的设备节点（/sys/class/block/X/partition 存在），排除虚拟设备
+blk_list() {
+    for _d in /sys/class/block/*; do
+        _n=${_d##*/}
+        case "$_n" in loop*|ram*|zram*|dm-*|sr*|md*|nbd*) continue ;; esac
+        [ -f "$_d/partition" ] || continue
+        [ -b "/dev/$_n" ] && $BB echo "/dev/$_n"
+    done
+}
+
+# [F2] 文件系统类型判定：不依赖 busybox blkid（v1.34.1-Magisk 不支持 -s/-o value，
+#      实测输出空且 rc=0）。直接读超级块魔数，这是内核每次挂载都会校验的字段：
+#        ext2/3/4 : 偏移 1080 起 2 字节 = 0x53EF（小端存为 53ef）
+#        swap     : 偏移 4086 起 10 字节 = "SWAPSPACE2"
+#        vfat     : 偏移 82 起 "FAT32   " / 偏移 54 起 "FAT"
+fs_type() {
+    _dev=$1
+    [ -b "$_dev" ] || { echo none; return; }
+    _m=$($BB dd if="$_dev" bs=1 skip=1080 count=2 2>/dev/null | $BB od -An -tx1 2>/dev/null | $BB tr -d ' \n')
+    case "$_m" in
+        53ef) echo ext4; return ;;
+    esac
+    _s=$($BB dd if="$_dev" bs=1 skip=4086 count=10 2>/dev/null)
+    case "$_s" in
+        SWAPSPACE2*) echo swap; return ;;
+    esac
+    _v=$($BB dd if="$_dev" bs=1 skip=82 count=8 2>/dev/null)
+    case "$_v" in
+        FAT32*) echo vfat; return ;;
+    esac
+    _v=$($BB dd if="$_dev" bs=1 skip=54 count=3 2>/dev/null)
+    case "$_v" in
+        FAT) echo vfat; return ;;
+    esac
+    echo unknown
+}
+
+# 从 sysfs uevent 读分区名（PARTNAME 是 GPT 分区名，initramfs 里唯一可靠的来源）
+part_name() {
+    $BB sed -n 's/^PARTNAME=//p' "/sys/class/block/${1##*/}/uevent" 2>/dev/null
+}
+
+# [F4] 自读文件系统属性：ext4 超级块在以 1024 字节为起点：
+#        s_uuid  @ 0x68=104 → 文件偏移 1128，16 字节，标准 UUID 字节序
+#        s_volume_name @ 0x78=120 → 文件偏移 1144，16 字节
+#      这样完全绕开 busybox blkid。
+fs_uuid() {
+    _dev=$1
+    [ -b "$_dev" ] || return 1
+    # 先读 ext4 超级块（快，不依赖外部工具）
+    _h=$($BB dd if="$_dev" bs=1 skip=1128 count=16 2>/dev/null | $BB od -An -tx1 2>/dev/null | $BB tr -d ' 
+')
+    if [ ${#_h} -eq 32 ] && [ "$_h" != "00000000000000000000000000000000" ]; then
+        $BB echo "$_h" | $BB sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/'
+        return 0
+    fi
+    # ext4 之外的 fs（vfat/swap 等）：用新版 busybox blkid 兜底
+    _u=$($BB blkid "$_dev" 2>/dev/null | $BB sed -n 's/.*UUID="\([^"]*\)".*/\1/p')
+    [ -n "$_u" ] && { $BB echo "$_u"; return 0; }
+    return 1
+}
+
+fs_label() {
+    _dev=$1
+    [ -b "$_dev" ] || return 1
+    $BB dd if="$_dev" bs=1 skip=1144 count=16 2>/dev/null | $BB tr -d '\\000'
+}
+
+# 按 GPT 分区名定位（读 sysfs uevent 的 PARTNAME，不依赖设备名、不调 blkid）
+part_by_partname() {
+    for _d in $(blk_list); do
+        [ "$(part_name "$_d")" = "$1" ] && { $BB echo "$_d"; return 0; }
+    done
+    return 1
+}
+
+# 轻量判断一个分区像不像 crux 根：只读挂载后看两个标志文件
+# （initramfs 里没有 blkid 也能用，纯挂载+路径检查）
+looks_like_root() {
+    _dev=$1
+    _mnt=/tmp/_lk
+    $BB mkdir -p "$_mnt" 2>/dev/null
+    if $BB mount -o ro -t ext4 "$_dev" "$_mnt" 2>/dev/null; then
+        _ok=1
+        [ -e "$_mnt/etc/os-release" ] || _ok=0
+        [ -x "$_mnt/sbin/init" ]      || _ok=0
+        $BB umount "$_mnt" 2>/dev/null
+        return $((1 - _ok))
+    fi
+    return 1
+}
+
+# 动态收集候选：
+#   第一优先：PARTNAME 像 linux-root* 的（明确是根）
+#   第二优先：其余 ext4（用魔数判定，不靠 blkid）
+#   明确排除：PARTNAME=userdata / swap / efi、以及 fs_type 非 ext4 的
+scan_candidates() {
+    _first=
+    _second=
+    for _d in $(blk_list); do
+        _pl=$(part_name "$_d")
+        case "$_pl" in
+            userdata|cache|cust|system|system_ext|vendor|product|odm|odm_dlkm|vendor_dlkm|system_dlkm|\
+            metadata|persist|modem|modemst1|modemst2|fsc|fsg|misc|keystore|frp|logfs|logdump|\
+            klog|bk*|xbl*|xbl_config*|cdt|ddr|mdmddr|multiimgoem|vbmeta*|storsec|devinfo|dtbo*|\
+            linux-swap|swap|efi|boot|recovery|super|vm-bootsys|vbmeta_system*) continue ;;
+        esac
+        case "$_pl" in
+            linux-root*) add_cand "$_d"; _first="$_first $_d"; continue ;;
+        esac
+        # 后备候选：必须真的是 ext4，且含 crux 根的标志文件才收（防止把
+        # Android 的 cache/cust 或其他 ext4 分区当成根）
+        if [ "$(fs_type "$_d")" = ext4 ] && looks_like_root "$_d"; then
+            add_cand "$_d"; _second="$_second $_d"
+        fi
+    done
+    return 0
 }
 
 # 2.1 显式 root= 优先
@@ -83,27 +217,28 @@ if [ -n "$ROOTSPEC" ]; then
     klog "root= 解析结果: ${d:-失败}"
 fi
 
-# 2.2 自动模式：按 PARTLABEL 惯例（由新到旧）
-if [ "$AUTO" = "1" ] && [ -z "$CANDS" ]; then
-    for pl in linux-root26 linux-root linux-root-next; do
-        d=$(by_spec "PARTLABEL=$pl")
-        [ -n "$d" ] && klog "PARTLABEL=$pl -> $d"
-        add_cand "$d"
-    done
-fi
-
-# 2.3 仍然没有：扫描所有块设备，挑“像 crux root 的 ext4”
+# 2.2 自动探测：动态扫描（不认固定设备名/分区号）
 if [ -z "$CANDS" ]; then
-    klog "扫描块设备寻找 crux 根分区…"
-    for d in /dev/sda* /dev/mmcblk*p* /dev/nvme*n*p*; do
-        [ -b "$d" ] || continue
-        typ=$($BB blkid -s TYPE -o value "$d" 2>/dev/null)
-        [ "$typ" = "ext4" ] || continue
-        add_cand "$d"
-    done
+    klog "动态扫描块设备…"
+    scan_candidates
+    klog "扫描候选:$CANDS"
 fi
 
-klog "候选列表:$CANDS"
+# ---------- 2.4) 等设备就绪（UFS 异步扫描 / devtmpfs 都可能比本脚本慢）----------
+# 实测：本脚本 1.6s 就跑到这里，而 ufshcd_probe_hba 还没扫完，/dev/sda* 尚未出现。
+# 此时直接判失败就会进 rescue shell，表现为“开机卡住/必须多开几次才正常”。
+_n=0
+while [ -z "$CANDS" ] && [ $_n -lt 80 ]; do
+    $BB sleep 0.5
+    _n=$((_n+1))
+    if [ $((_n % 10)) -eq 0 ]; then klog "stage: waiting-dev $((_n/2))s"; fi
+    if [ -n "$ROOTSPEC" ]; then
+        _d=$(by_spec "$ROOTSPEC"); [ -n "$_d" ] && add_cand "$_d"
+    fi
+    [ -z "$CANDS" ] && scan_candidates
+done
+[ $_n -gt 0 ] && klog "等设备 ${_n}00ms 后候选:$CANDS"
+klog "stage: resolve-done cands=[$CANDS]"
 
 # ---------- 3) 体检 + 修复 + 挂载 ----------
 # probe_root: 只读挂载并检查像不像一个可启动的 crux 根
@@ -134,13 +269,17 @@ FSCKED=
 for cand in $CANDS; do
     [ -b "$cand" ] || continue
     klog "尝试 $cand"
+    klog "stage: probe-root $cand"
     if ! probe_root "$cand"; then
         klog "$cand 不像 crux 根（缺 os-release / sbin/init），跳过"
         continue
     fi
+    klog "stage: fsck-start $cand"
     fsck_dev "$cand"; FSCKED=$cand
+    klog "stage: fsck-done $cand"
 
     $BB mkdir -p /newroot
+    klog "stage: mount-rw $cand"
     if $BB mount -t ext4 "$cand" /newroot 2>/dev/null || $BB mount "$cand" /newroot 2>/dev/null; then
         DEV=$cand
         klog "已挂载根分区: $DEV"
@@ -158,12 +297,12 @@ for cand in $CANDS; do
 done
 
 if [ -z "$DEV" ]; then
-    say "FAILED: 找不到可用的根分区"
+    say "FAILED: 找不到可用的根分区 -> rescue shell"
     klog "候选:$CANDS"
     $BB echo ""
     $BB echo "crux initramfs: 无法定位根分区。"
     $BB echo "候选:$CANDS"
-    $BB echo "可手动尝试: mount /dev/sdaXX /root"
+    $BB echo "可手动尝试: mount /dev/<磁盘><分区> /root"
     exec $BB sh
 fi
 
@@ -197,11 +336,14 @@ fi
 
 # 5.2 fstab 的根条目 vs 实际设备
 FSTAB_ROOT=$($BB sed -n 's/^[[:space:]]*\([^#[:space:]]*\)[[:space:]]\+[[:space:]]*\/[[:space:]].*/\1/p' /newroot/etc/fstab 2>/dev/null | $BB head -1)
-ACT_PL=$($BB blkid -s PARTLABEL -o value "$DEV" 2>/dev/null)
-ACT_UUID=$($BB blkid -s UUID -o value "$DEV" 2>/dev/null)
+# [F4] 不用 blkid（initramfs 里的 busybox 不支持 -s/-o value，会拿到空或整行）
+ACT_PL=$(part_name "$DEV")
+ACT_UUID=$(fs_uuid "$DEV")
+ACT_FSTYPE=$(fs_type "$DEV")
+ACT_PARTUUID=$($BB sed -n 's/^PARTUUID=//p' "/sys/class/block/${DEV##*/}/uevent" 2>/dev/null)
 FSTAB_OK=unknown
 case "$FSTAB_ROOT" in
-    PARTLABEL=*) [ "${FSTAB_ROOT#PARTLABEL=}" = "$ACT_PL" ] && FSTAB_OK=yes || FSTAB_OK=NO ;;
+    PARTLABEL=*|PARTNAME=*) [ "${FSTAB_ROOT#*=}" = "$ACT_PL" ] && FSTAB_OK=yes || FSTAB_OK=NO ;;
     UUID=*)      [ "${FSTAB_ROOT#UUID=}" = "$ACT_UUID" ] && FSTAB_OK=yes || FSTAB_OK=NO ;;
     *) FSTAB_OK="n/a($FSTAB_ROOT)" ;;
 esac
@@ -231,7 +373,8 @@ klog "上次关机: $VERDICT"
     $BB echo "cmdline   : $CMDLINE"
     $BB echo "rootspec  : ${ROOTSPEC:-auto}"
     $BB echo "cands     :$CANDS"
-    $BB echo "rootdev   : $DEV (PARTLABEL=$ACT_PL UUID=$ACT_UUID)"
+    $BB echo "rootdev   : $DEV (PARTNAME=$ACT_PL fstype=$ACT_FSTYPE UUID=$ACT_UUID)"
+    $BB echo "partuuid  : $ACT_PARTUUID"
     $BB echo "fsck      : ${FSCKED:-none}"
     $BB echo "rw        : $RW_OK"
     $BB echo "modules   : $MOD_OK (/lib/modules/$KVER)"
@@ -252,9 +395,18 @@ setsid $BB sh -c '
     printf "%s\n" "$line" >> "$OUT" 2>/dev/null
     n=$((n+1))
     if [ $((n % 64)) -eq 0 ]; then /bin/busybox sync 2>/dev/null; fi
+    # [crux] systemd 接手后必须退出：否则这个 initramfs 时代起的进程会一直持有
+    # rootfs 上 crux-early.log 的写句柄、还带 trap "" 忽略 SIGTERM，
+    # 关机时 systemd-shutdown 会卡在 "Waiting for process: busybox"，
+    # 只能强断电源，导致 ext4 脏 + 硬件状态没走完，下次启动异常。
+    if [ -e /newroot/run/systemd/system ]; then
+      /bin/busybox sync 2>/dev/null
+      break
+    fi
   done
 ' >/dev/null 2>&1 &
 
+klog "stage: pre-switch-root dev=$DEV"
 say "switch_root -> $DEV"
 $BB mount -t proc proc /newroot/proc 2>/dev/null
 $BB mount -t sysfs sysfs /newroot/sys 2>/dev/null
