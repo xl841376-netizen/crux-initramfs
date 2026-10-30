@@ -1,7 +1,7 @@
 #!/bin/busybox sh
 # ============================================================
 #  crux initramfs — 根分区自动选择 + 分区体检/修复
-#  版本: 2026.10.30-r3  (earlylog 进程可被 SIGTERM 终止 + switch_root 后退出判据修正)
+#  版本: 2026.10.30-r4  (earlylog: fd 继承写日志 + 可被 SIGTERM 终止 + 退出判据修正)
 #
 #  设计原则
 #   1) grub 传的 root= 优先；只有完全没给 / 给 auto 时才自动探测
@@ -385,21 +385,35 @@ klog "上次关机: $VERDICT"
 $BB sync
 
 # ---------- 6) earlylog（不依赖 systemd 持续落盘内核日志）----------
+# [r4] 三个关键点：
+#  1) 日志用「一次性路径重定向 + 继承 fd」写：switch_root 后 /newroot 消失，
+#     但已打开的 fd 仍指向 rootfs 上同一个 inode，照样能写。
+#     （r3 及以前每行都 >> /newroot/...，switch_root 后全部写失败，日志停在 912 字节）
+#  2) 不忽略 SIGTERM：关机时 systemd-shutdown 发信号能直接送走，不会卡在
+#     "Waiting for process: busybox"。
+#  3) 退出判据同时看 /run/systemd/system（switch_root 后有效）与
+#     /newroot/run/systemd/system（switch_root 前有效），并加行数上限兜底。
 setsid $BB sh -c '
-  trap 'exit 0' TERM HUP INT QUIT
-  OUT=/newroot/var/log/crux-early.log
+  trap "exit 0" TERM HUP INT QUIT
+  LOG=/newroot/var/log/crux-early.log
   $BB mkdir -p /newroot/var/log 2>/dev/null
-  : > "$OUT" 2>/dev/null
+  if [ ! -w /newroot/var/log ]; then
+    LOG=/var/log/crux-early.log
+    $BB mkdir -p /var/log 2>/dev/null
+  fi
+  : > "$LOG" 2>/dev/null
+  exec >> "$LOG" 2>&1
   n=0
   /bin/busybox cat /dev/kmsg 2>/dev/null | while IFS= read -r line; do
-    printf "%s\n" "$line" >> "$OUT" 2>/dev/null
+    printf "%s
+" "$line"
     n=$((n+1))
     if [ $((n % 64)) -eq 0 ]; then /bin/busybox sync 2>/dev/null; fi
-    # [crux] systemd 接手后必须退出：否则这个 initramfs 时代起的进程会一直持有
-    # rootfs 上 crux-early.log 的写句柄、还带 trap "" 忽略 SIGTERM，
-    # 关机时 systemd-shutdown 会卡在 "Waiting for process: busybox"，
-    # 只能强断电源，导致 ext4 脏 + 硬件状态没走完，下次启动异常。
     if [ -e /run/systemd/system ] || [ -e /newroot/run/systemd/system ]; then
+      /bin/busybox sync 2>/dev/null
+      break
+    fi
+    if [ "$n" -gt 40000 ]; then
       /bin/busybox sync 2>/dev/null
       break
     fi
