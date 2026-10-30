@@ -1,7 +1,7 @@
 #!/bin/busybox sh
 # ============================================================
 #  crux initramfs — 根分区自动选择 + 分区体检/修复
-#  版本: 2026.10.30-r4  (earlylog: fd 继承写日志 + 可被 SIGTERM 终止 + 退出判据修正)
+#  版本: 2026.10.30-r5  (earlylog: fd 继承写日志 + SIGTERM 可终止 + /proc/1/root 退出判据)
 #
 #  设计原则
 #   1) grub 传的 root= 优先；只有完全没给 / 给 auto 时才自动探测
@@ -391,8 +391,11 @@ $BB sync
 #     （r3 及以前每行都 >> /newroot/...，switch_root 后全部写失败，日志停在 912 字节）
 #  2) 不忽略 SIGTERM：关机时 systemd-shutdown 发信号能直接送走，不会卡在
 #     "Waiting for process: busybox"。
-#  3) 退出判据同时看 /run/systemd/system（switch_root 后有效）与
-#     /newroot/run/systemd/system（switch_root 前有效），并加行数上限兜底。
+#  3) 退出判据用跨根可见的 /proc/1/root/run/systemd/system（PID1 切根后其 root
+#     就是磁盘 rootfs），再兼容 /run/systemd/system 与 /newroot/run/systemd/system。
+#     注意：早于 switch_root 起的进程，其 / 仍是 initramfs 的 rootfs，且 /newroot
+#     被 mount --move 后变成空目录，所以这两个路径在它眼里都不可用（r4 实测中招）。
+#     另加 40000 行上限兜底。
 setsid $BB sh -c '
   trap "exit 0" TERM HUP INT QUIT
   LOG=/newroot/var/log/crux-early.log
@@ -409,7 +412,7 @@ setsid $BB sh -c '
 " "$line"
     n=$((n+1))
     if [ $((n % 64)) -eq 0 ]; then /bin/busybox sync 2>/dev/null; fi
-    if [ -e /run/systemd/system ] || [ -e /newroot/run/systemd/system ]; then
+    if [ -e /proc/1/root/run/systemd/system ] || [ -e /run/systemd/system ] || [ -e /newroot/run/systemd/system ]; then
       /bin/busybox sync 2>/dev/null
       break
     fi
